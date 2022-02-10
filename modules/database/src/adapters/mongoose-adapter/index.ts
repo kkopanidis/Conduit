@@ -74,6 +74,21 @@ export class MongooseAdapter extends DatabaseAdapter<MongooseSchema> {
       });
   }
 
+  extensionFieldsExist(schema: ConduitSchema, fields: ConduitSchema['fields'], extOwner: string) {
+    for (const field of Object.keys(fields)) {
+      if (field in schema.fields) return true;
+    }
+    if (schema.schemaOptions.conduit && schema.schemaOptions.conduit.extensions) {
+      for (const ext of schema.schemaOptions.conduit.extensions) {
+        if (ext.ownerModule === extOwner) continue;
+        for (const field of Object.keys(fields)) {
+          if (field in ext.fields) return true;
+        }
+      }
+    }
+    return false;
+  }
+
   async createSchemaFromAdapter(schema: ConduitSchema): Promise<MongooseSchema> {
     if (!this.models) {
       this.models = {};
@@ -90,27 +105,70 @@ export class MongooseAdapter extends DatabaseAdapter<MongooseSchema> {
       delete this.mongoose.connection.models[schema.name];
     }
     const owned = await this.checkModelOwnership(schema);
-    if (!owned) {
-      throw new GrpcError(status.PERMISSION_DENIED, 'Not authorized to modify model');
+    let declaredSchema: ConduitSchema;
+    let newSchema: ConduitSchema;
+    if (owned) {
+      this.addSchemaPermissions(schema);
+      declaredSchema = schema;
+      newSchema = schemaConverter(schema);
+    } else {
+      // Schema Extensions
+      delete schema.fields._id;
+      delete schema.fields.createdAt;
+      delete schema.fields.updatedAt;
+      declaredSchema = this.registeredSchemas.get(schema.name)!;
+      if (declaredSchema.name === '_DeclaredSchema' ||
+          !declaredSchema.schemaOptions.conduit ||
+          !declaredSchema.schemaOptions.conduit!.permissions ||
+          !declaredSchema.schemaOptions.conduit!.permissions!.extendable) {
+        throw new GrpcError(status.PERMISSION_DENIED, 'Schema already exists and is not extendable');
+      }
+      if (!declaredSchema.schemaOptions.conduit.extensions) {
+        declaredSchema.schemaOptions.conduit.extensions = [];
+      }
+      const index = declaredSchema.schemaOptions.conduit.extensions.findIndex((ext: any) => ext.ownerModule === schema.ownerModule);
+      if (index === -1) {
+        // Create Extension
+        if (Object.keys(schema.fields).length === 0) {
+          throw new GrpcError(status.INVALID_ARGUMENT, 'Could not create schema extension with no custom fields');
+        }
+        if (this.extensionFieldsExist(declaredSchema, schema.fields, schema.ownerModule)) {
+          throw new GrpcError(status.ALREADY_EXISTS, 'Could not create schema extension due to duplicate fields');
+        }
+        declaredSchema.schemaOptions.conduit.extensions.push({
+          fields: schema.fields,
+          ownerModule: schema.ownerModule,
+          createdAt: new Date(), // TODO FORMAT
+          updatedAt: new Date(), // TODO FORMAT
+        });
+      } else {
+        if (Object.keys(schema.fields).length === 0) {
+          declaredSchema.schemaOptions.conduit.extensions.splice(index, 1);
+        } else {
+          // Update Extension
+          if (this.extensionFieldsExist(declaredSchema, schema.fields, schema.ownerModule)) {
+            throw new GrpcError(status.ALREADY_EXISTS, 'Could not update schema extension due to duplicate fields');
+          }
+          declaredSchema.schemaOptions.conduit.extensions[index].fields = schema.fields;
+          declaredSchema.schemaOptions.conduit.extensions[index].fields.updatedAt = new Date(); // TODO FORMAT
+        }
+      }
     }
 
-    this.addSchemaPermissions(schema);
-
-    let newSchema = schemaConverter(schema);
-
-    this.registeredSchemas.set(schema.name, schema);
-    this.models[schema.name] = new MongooseSchema(
+    newSchema = schemaConverter(declaredSchema);
+    this.registeredSchemas.set(declaredSchema.name, declaredSchema);
+    this.models[declaredSchema.name] = new MongooseSchema(
       this.mongoose,
       newSchema,
-      schema,
+      declaredSchema,
       deepPopulate,
       this
     );
-    if (schema.name !== '_DeclaredSchema') {
-      await this.saveSchemaToDatabase(schema);
+    if (declaredSchema.name !== '_DeclaredSchema') {
+      await this.saveSchemaToDatabase(declaredSchema);
     }
 
-    return this.models![schema.name];
+    return this.models![declaredSchema.name];
   }
 
   getSchema(schemaName: string): ConduitSchema {
@@ -120,14 +178,46 @@ export class MongooseAdapter extends DatabaseAdapter<MongooseSchema> {
     throw new GrpcError(status.NOT_FOUND, `Schema ${schemaName} not defined yet`);
   }
 
+  getSchemaStitched(schemaName: string): ConduitSchema {
+    if (this.models && this.models![schemaName]) {
+      const schema = this.models![schemaName].originalSchema;
+      if (schema.schemaOptions.conduit && schema.schemaOptions.conduit!.extensions) {
+        schema.schemaOptions.conduit!.extensions.forEach((ext: any) => {
+          for (const field of Object.keys(ext.fields)) {
+            schema.fields[field] = ext.fields[field];
+          }
+        });
+      }
+      return schema;
+    }
+    throw new GrpcError(status.NOT_FOUND, `Schema ${schemaName} not defined yet`);
+  }
+
   getSchemas(): ConduitSchema[] {
     if (!this.models) {
       return [];
     }
-
     const self = this;
     return Object.keys(this.models).map((modelName) => {
       return self.models![modelName].originalSchema;
+    });
+  }
+
+  getSchemasStitched(): ConduitSchema[] {
+    if (!this.models) {
+      return [];
+    }
+    const self = this;
+    return Object.keys(this.models).map((modelName) => {
+      const schema = self.models![modelName].originalSchema;
+      if (schema.schemaOptions.conduit && schema.schemaOptions.conduit!.extensions) {
+        schema.schemaOptions.conduit!.extensions.forEach((ext: any) => {
+          for (const field of Object.keys(ext.fields)) {
+            schema.fields[field] = ext.fields[field];
+          }
+        });
+      }
+      return schema;
     });
   }
 
@@ -164,7 +254,7 @@ export class MongooseAdapter extends DatabaseAdapter<MongooseSchema> {
 
     delete this.models![schemaName];
     delete this.mongoose.connection.models[schemaName];
-    return 'Schema deleted!'
+    return 'Schema deleted!';
     // TODO should we delete anything else?
   }
 }
