@@ -1,7 +1,12 @@
 import { MongooseAdapter } from './adapters/mongoose-adapter';
 import { SequelizeAdapter } from './adapters/sequelize-adapter';
 import { SchemaAdapter } from './interfaces';
-import ConduitGrpcSdk, { ConduitSchema, ConduitServiceModule, GrpcServer } from '@conduitplatform/conduit-grpc-sdk';
+import ConduitGrpcSdk, {
+  ConduitSchema,
+  ConduitServiceModule,
+  GrpcServer,
+  GrpcError
+} from '@conduitplatform/conduit-grpc-sdk';
 import { status } from '@grpc/grpc-js';
 import path from 'path';
 import {
@@ -117,25 +122,95 @@ export class DatabaseProvider extends ConduitServiceModule {
     });
   }
 
+  private extensionFieldsExist(baseSchema: ConduitSchema, fields: ConduitSchema['fields'], extOwner: string) {
+    for (const field of Object.keys(fields)) {
+      if (field in baseSchema.fields) return true;
+    }
+    if (baseSchema.schemaOptions.conduit && baseSchema.schemaOptions.conduit.extensions) {
+      for (const ext of baseSchema.schemaOptions.conduit.extensions) {
+        if (ext.ownerModule === extOwner) continue;
+        for (const field of Object.keys(fields)) {
+          if (field in ext.fields) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private setSchemaExtension(baseSchema: ConduitSchema, extensionSchema: ConduitSchema) {
+    if (
+        !baseSchema.schemaOptions.conduit ||
+        !baseSchema.schemaOptions.conduit.permissions ||
+        !baseSchema.schemaOptions.conduit.permissions.extendable
+    ) { throw new GrpcError(status.PERMISSION_DENIED, 'Schema already exists and is not extendable'); }
+    delete extensionSchema.fields._id;
+    delete extensionSchema.fields.createdAt;
+    delete extensionSchema.fields.updatedAt;
+    const extIndex = baseSchema.schemaOptions.conduit.extensions.findIndex(
+        (ext: any) => ext.ownerModule === extensionSchema.ownerModule
+    );
+    if (extIndex === -1) {
+      // Create Extension
+      if (Object.keys(extensionSchema.fields).length === 0) {
+        throw new GrpcError(
+            status.INVALID_ARGUMENT,
+            'Could not create extensionSchema extension with no custom fields'
+        );
+      }
+      if (this.extensionFieldsExist(baseSchema, extensionSchema.fields, extensionSchema.ownerModule)) {
+        throw new GrpcError(
+            status.ALREADY_EXISTS,
+            'Could not create schema extension due to duplicate fields'
+        );
+      }
+      baseSchema.schemaOptions!.conduit!.extensions.push({
+        fields: extensionSchema.fields,
+        ownerModule: extensionSchema.ownerModule,
+        createdAt: new Date(), // TODO FORMAT
+        updatedAt: new Date(), // TODO FORMAT
+      });
+    } else {
+      if (Object.keys(extensionSchema.fields).length === 0) {
+          baseSchema.schemaOptions.conduit.extensions.splice(extIndex, 1);
+        } else {
+          // Update Extension
+          if (this.extensionFieldsExist(baseSchema, extensionSchema.fields, extensionSchema.ownerModule)) {
+            throw new GrpcError(status.ALREADY_EXISTS, 'Could not update schema extension due to duplicate fields');
+          }
+          baseSchema.schemaOptions.conduit.extensions[extIndex].fields = extensionSchema.fields;
+          baseSchema.schemaOptions.conduit.extensions[extIndex].fields.updatedAt = new Date(); // TODO FORMAT
+        }
+    }
+  }
+
   /**
    * Should accept a JSON schema and output a .ts interface for the adapter
    * @param call
    * @param callback
    */
   async createSchemaFromAdapter(call: CreateSchemaRequest, callback: SchemaResponse) {
+    if (call.request.schema.name.indexOf('-') >= 0 || call.request.schema.name.indexOf(' ') >= 0) {
+      return callback({
+        code: status.INVALID_ARGUMENT,
+        message: 'Names cannot include spaces and - characters',
+      });
+    }
     let schema = new ConduitSchema(
       call.request.schema.name,
       JSON.parse(call.request.schema.modelSchema),
       JSON.parse(call.request.schema.modelOptions),
       call.request.schema.collectionName
     );
-    if (schema.name.indexOf('-') >= 0 || schema.name.indexOf(' ') >= 0) {
-      return callback({
-        code: status.INVALID_ARGUMENT,
-        message: 'Names cannot include spaces and - characters',
-      });
-    }
     schema.ownerModule = (call as any).metadata.get('module-name')[0];
+    let existingSchema: ConduitSchema | null;
+    try {
+      existingSchema = this._activeAdapter.getSchema(schema.name)
+    } catch { existingSchema = null }
+    if (existingSchema && existingSchema.ownerModule !== schema.ownerModule) {
+      // Handle Extension Case
+      this.setSchemaExtension(existingSchema, schema);
+      schema = existingSchema;
+    }
     await this._activeAdapter
       .createSchemaFromAdapter(schema)
       .then((schemaAdapter: SchemaAdapter<any>) => {

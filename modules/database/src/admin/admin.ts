@@ -4,9 +4,9 @@ import ConduitGrpcSdk, {
   constructConduitRoute,
   GrpcServer,
   UnparsedRouterResponse,
-  ConduitNumber,
   ParsedRouterRequest,
   GrpcError,
+  ConduitNumber,
   ConduitJson,
 } from '@conduitplatform/conduit-grpc-sdk';
 import { status } from '@grpc/grpc-js';
@@ -101,23 +101,29 @@ export class AdminHandlers {
     const { limit } = call.request.params ?? 25;
     const query = '{}';
     const schemaAdapter = this._activeAdapter.getSchemaModel('_DeclaredSchema');
-    const declaredSchemasExtensionsPromise = schemaAdapter.model
+    const declaredSchemasPromise = schemaAdapter.model
       .findMany(
         query,
         skip,
         limit,
-        'name extensions',
+        'name modelOptions.conduit.extensions',
         undefined,
       );
     const totalCountPromise = schemaAdapter.model.countDocuments(query);
 
-    const [declaredSchemasExtensions, totalCount] = await Promise.all([
-      declaredSchemasExtensionsPromise,
+    let [schemas, totalCount] = await Promise.all([
+      declaredSchemasPromise,
       totalCountPromise,
     ]).catch((e: Error) => {
       throw new GrpcError(status.INTERNAL, e.message);
     });
-    return { declaredSchemasExtensions, totalCount };
+    schemas.forEach((schema: any) => {
+      if (schema.modelOptions && schema.modelOptions.conduit && schema.modelOptions.conduit.extensions) {
+        schema.extensions = schema.modelOptions.conduit.extensions;
+      } else { schema.extensions = []; }
+      delete schema.modelOptions;
+    });
+    return { declaredSchemasExtensions: schemas, totalCount };
   }
 
 }

@@ -67,7 +67,6 @@ export function validateSchemaInput(
   if (!isPlainObject(fields)) {
     return '\'fields\' must be an object';
   }
-  if (isEmpty(fields)) return '\'fields\' can\'t be an empty object';
 
   let fieldsErrorFlag = false;
   deepdash.eachDeep(fields, (value: any, key: any, parent: any, ctx: any) => {

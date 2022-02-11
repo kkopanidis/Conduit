@@ -116,9 +116,6 @@ export class SchemaAdmin {
     const existingSchema = await _DeclaredSchema.getInstance()
       .findOne({ name })
       .catch((e: Error) => { throw new GrpcError(status.INTERNAL, e.message); });
-    if (existingSchema) {
-      throw new GrpcError(status.ALREADY_EXISTS, 'Schema name is already in use!');
-    }
 
     Object.assign(fields, {
       _id: TYPE.ObjectId,

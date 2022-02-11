@@ -164,7 +164,7 @@ export class MongooseAdapter extends DatabaseAdapter<MongooseSchema> {
 
     delete this.models![schemaName];
     delete this.mongoose.connection.models[schemaName];
-    return 'Schema deleted!'
+    return 'Schema deleted!';
     // TODO should we delete anything else?
   }
 }
